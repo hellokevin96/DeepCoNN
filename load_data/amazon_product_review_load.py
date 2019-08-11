@@ -3,6 +3,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from util import split_sentence_to_word_list, words2ids
 import logging
+import os
 
 logger = logging.getLogger('DeepCoNN.load_data')
 
@@ -18,7 +19,8 @@ def load_data(data_path):
     del data_pd['summary']
     del data_pd['unixReviewTime']
 
-    # data_pd = data_pd[:1000]
+    logger.info('Compile data statistic')
+    dataset_statistic(data_pd, os.path.dirname(data_path))
 
     # review data_frame, keys: review_text, token_ids
     logger.info("Get review data frame.")
@@ -50,7 +52,14 @@ def load_data(data_path):
     return user_item_rating, review_pd, user_to_review_ids, item_to_review_ids
 
 
-def dataset_statistics(data_frame: pd.DataFrame):
+def dataset_statistic(data_frame: pd.DataFrame, folder: str):
+    """
+    statistics of data: #user, #item, #review, #word,
+    #review per user, #word per user
+    :param data_frame: columns: user, item, review_text
+    :param folder: fig save folder path
+    :return: None
+    """
     data_frame['review_word_count'] = \
         data_frame.apply(lambda x: len(x['review_text'].split()), axis=1)
     user_size = data_frame['user'].drop_duplicates().size
@@ -70,8 +79,5 @@ def dataset_statistics(data_frame: pd.DataFrame):
                              word_count/user_size,
                              word_count/review_size))
     data_frame['review_word_count'].plot.box()
-    plt.show()
+    plt.savefig(folder + '\\review_word_count_box.jpg')
 
-
-if __name__ == '__main__':
-    load_data('data/music/Digital_Music_5.json')

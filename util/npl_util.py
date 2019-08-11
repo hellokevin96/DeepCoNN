@@ -14,10 +14,10 @@ gensim_model = KeyedVectors.load_word2vec_format(
     binary=True, )
 util_logger.info('loaded')
 
-util_logger.info('loading spacy pretrained word2vec model')
+# util_logger.info('loading spacy pretrained word2vec model')
 # spacy_model = spacy.load('en_core_web_sm')
-spacy_model = spacy.load('en_core_web_lg')
-util_logger.info('loaded')
+# spacy_model = spacy.load('en_core_web_lg')
+# util_logger.info('loaded')
 
 
 def word2vec(word: str):
@@ -66,7 +66,7 @@ def words2ids(words: list):
 
 def get_unused_words(words: list):
     """
-    返回在word2vec中没有训练的单词
+    返回在word2vec中没有对应向量的单词
     :param words:
     :return: list(str)
     """
@@ -109,21 +109,12 @@ def clean_str(string):
     string = re.sub(r"\'ll", " \'ll", string)
     string = re.sub(r",", " , ", string)
     string = re.sub(r"!", " ! ", string)
-    string = re.sub(r"\(", ' \( ', string)
-    string = re.sub(r"\)", " \) ", string)
-    string = re.sub(r"\?", " \? ", string)
+    string = re.sub(r"\(", r' \( ', string)
+    string = re.sub(r"\)", r" \) ", string)
+    string = re.sub(r"\?", r" \? ", string)
     string = re.sub(r"\s{2,}", " ", string)
     return string.strip().lower()
 
 
 def split_sentence_to_word_list(sent: str):
     return clean_str(sent).split()
-
-
-def split_sent_to_token_ids(sent: str):
-    return words2ids(tokenize(sent))
-
-
-def tokenize(sent: str):
-    doc = spacy_model(sent)
-    return [x.text for x in doc]

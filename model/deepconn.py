@@ -1,13 +1,13 @@
 # -*- coding: utf-8 -*-
+import os
+
 import pandas as pd
 import torch.nn as nn
 import torch.nn
 from torch.utils.data import DataLoader, Dataset
 import logging
 from util.npl_util import gensim_model
-# from torch.optim import Adam
 
-# os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
 logger = logging.getLogger('DeepCoNN.train_test')
 
 
@@ -153,21 +153,39 @@ class DeepCoNNTrainTest:
         self.batch_size = batch_size
         self.review_length = review_length
         self.is_cuda = is_cuda
+        self.data_folder = data_folder
 
         logger.info('epoch:{:<8d} batch size:{:d}'.format(epoch, batch_size))
 
         # read data
         self.user_item_rating = pd.read_json(
-            'data/{}/user_item_rating.json'.format(data_folder))
+            '{}/user_item_rating.json'.format(data_folder))
         self.review = pd.read_json(
-            'data/{}/review.json'.format(data_folder))
+            '{}/review.json'.format(data_folder))
         self.user_to_review_ids = pd.read_json(
-            'data/{}/user_to_review_ids.json'.format(data_folder))
+            '{}/user_to_review_ids.json'.format(data_folder))
         self.item_to_review_ids = pd.read_json(
-            'data/{}/item_to_review_ids.json'.format(data_folder))
+            '{}/item_to_review_ids.json'.format(data_folder))
 
-        train_data, self.valid_data, self.test_data \
-            = data_split(self.user_item_rating)
+        if os.path.exists(
+                os.path.join(data_folder, 'train_user_item_rating.json')):
+
+            train_data = pd.read_json(
+                '{}/train_user_item_rating.json'.format(data_folder))
+            self.valid_data = pd.read_json(
+                '{}/valid_user_item_rating.json'.format(data_folder))
+            self.test_data = pd.read_json(
+                '{}/test_user_item_rating.json'.format(data_folder))
+        else:
+            train_data, self.valid_data, self.test_data \
+                = data_split(self.user_item_rating)
+
+            train_data.to_json(
+                '{}/train_user_item_rating.json'.format(data_folder))
+            self.valid_data.to_json(
+                '{}/valid_user_item_rating.json'.format(data_folder))
+            self.test_data.to_json(
+                '{}/test_user_item_rating.json'.format(data_folder))
 
         logger.info('average sentences length: {:d}'.format(review_length))
 
@@ -235,9 +253,10 @@ class DeepCoNNTrainTest:
 
             # validate
             valid_user_review_vectors, valid_item_review_vectors = \
-                self.uir_to_token_vectors(self.valid_data)
+                self.uir_to_token_vectors(self.valid_data
+                                          .tail(200))  # memory limit
 
-            valid_rating = self.valid_data['rating'].to_list()
+            valid_rating = self.valid_data['rating'].tail(200).to_list()
             valid_rating = torch.Tensor(valid_rating)
             if self.is_cuda:
                 valid_rating = valid_rating.cuda()
@@ -249,31 +268,45 @@ class DeepCoNNTrainTest:
             logger.info(
                 'valid mse_loss: {:.5f}'.format(valid_loss.cpu().data.numpy()))
 
-        torch.save(self.model, 'DeepCoNN.pkl')
+        torch.save(self.model.cpu(),
+                   os.path.join(self.data_folder, 'DeepCoNN.pkl'))
 
     def test(self):
-        self.model = torch.load('DeepCoNN.pkl')
+        self.model = torch.load(os.path.join(self.data_folder, 'DeepCoNN.pkl'))
         if self.is_cuda:
             self.model.cuda()
-        test_user_review_vectors, test_item_review_vectors = \
-            self.uir_to_token_vectors(self.test_data)
+
+        batch_size = 100
+        test_pred = torch.Tensor()
+        if self.is_cuda:
+            test_pred = test_pred.cuda()
+        for i in range(0, len(self.test_data), batch_size):
+            test_user_review_vectors, test_item_review_vectors = \
+                self.uir_to_token_vectors(self.test_data
+                                          .loc[i: i+batch_size-1, :])
+
+            batch_pred = self.model(test_user_review_vectors,
+                                    test_item_review_vectors)
+
+            test_pred = torch.cat((test_pred, batch_pred))
 
         test_rating = self.test_data['rating'].to_list()
         test_rating = torch.Tensor(test_rating)
         if self.is_cuda:
             test_rating = test_rating.cuda()
 
-        test_pred = self.model(test_user_review_vectors,
-                               test_item_review_vectors)
-
         print('actual rating:')
         print(test_rating.cpu()[:10])
         print('predicting rating:')
         print(test_pred.cpu()[:10])
 
+        print(test_pred.shape, test_rating.shape)
         test_loss = self.loss_func(test_pred, test_rating)
         logger.info(
-            'test mse_loss: {:.5f}'.format( test_loss.cpu().data.numpy()))
+            'test mse_loss: {:.5f}'.format(test_loss.cpu().data.numpy()))
+
+        self.test_data['predict_rating'] = test_pred.tolist()
+        self.test_data.to_csv(os.path.join(self.data_folder, 'test_result.csv'))
 
     def uir_to_token_vectors(self, uir: pd.DataFrame):
         """
