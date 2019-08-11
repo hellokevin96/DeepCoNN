@@ -192,7 +192,7 @@ class DeepCoNNTrainTest:
         # initial DeepCoNN model
         self.model = DeepCoNN(review_length=review_length,
                               word_vec_dim=300,
-                              conv_length=10,
+                              conv_length=3,
                               conv_kernel_num=100,
                               latent_factor_num=100,
                               is_cuda=self.is_cuda)
@@ -307,6 +307,13 @@ class DeepCoNNTrainTest:
 
         self.test_data['predict_rating'] = test_pred.tolist()
         self.test_data.to_csv(os.path.join(self.data_folder, 'test_result.csv'))
+
+        self.test_data['square_test'] \
+            = (self.test_data['rating'] - self.test_data['predict_rating']) ** 2
+
+        mse_on_rating = self.test_data.groupby('rating')['square_error'].mean()
+        mse_on_rating.to_csv(os.path.join(self.data_folder,
+                                          'test_mse_of_ratings'))
 
     def uir_to_token_vectors(self, uir: pd.DataFrame):
         """
