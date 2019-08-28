@@ -3,21 +3,15 @@ import numpy as np
 from gensim.models.keyedvectors import KeyedVectors
 import logging
 import re
-import spacy
 
 util_logger = logging.getLogger('DeepCoNN.npl')
 
 util_logger.info('loading google pretrained word2vec model')
 gensim_model = KeyedVectors.load_word2vec_format(
     'data/GoogleNews-vectors-negative300.bin',
-    # limit=30000,
-    binary=True, )
+    limit=int(1e4),
+    binary=True)
 util_logger.info('loaded')
-
-# util_logger.info('loading spacy pretrained word2vec model')
-# spacy_model = spacy.load('en_core_web_sm')
-# spacy_model = spacy.load('en_core_web_lg')
-# util_logger.info('loaded')
 
 
 def word2vec(word: str):

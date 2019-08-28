@@ -1,28 +1,41 @@
 # -*- coding: utf-8 -*-
+import copy
+import json
 import os
-
+import random
+import lmdb
 import pandas as pd
 import torch.nn as nn
 import torch.nn
 from torch.utils.data import DataLoader, Dataset
 import logging
+from util import data_split_pandas
 from util.npl_util import gensim_model
 
 logger = logging.getLogger('DeepCoNN.train_test')
 
 
-def data_split(data: pd.DataFrame,
-               train_ratio=.8, valid_ratio=.1, test_ratio=.1):
-    assert (train_ratio + valid_ratio + test_ratio) == 1., 'ratio sum != 1'
-    data = data.sample(frac=1).reset_index(drop=True)  # shuffle
-    train_index = int(len(data) * train_ratio)
-    valid_index = int(len(data) * (train_ratio + valid_ratio))
+class FactorizationMachine(nn.Module):
 
-    train_data = data.loc[:train_index, :].reset_index(drop=True)
-    valid_data = data.loc[train_index: valid_index, :].reset_index(drop=True)
-    test_data = data.loc[valid_index:, :].reset_index(drop=True)
+    # noinspection PyArgumentList
+    def __init__(self, factor_size: int, fm_k: int):
+        super(FactorizationMachine, self).__init__()
+        self._linear = nn.Linear(factor_size, 1)
+        self._v = torch.nn.Parameter(torch.randn((factor_size, fm_k)))
+        self._drop = nn.Dropout(0.2)
 
-    return train_data, valid_data, test_data
+    def forward(self, x):
+        # linear regression
+        w = self._linear(x).squeeze()
+
+        # cross feature
+        inter1 = torch.matmul(x, self._v)
+        inter2 = torch.matmul(x**2, self._v**2)
+        inter = (inter1**2 - inter2) * 0.5
+        inter = self._drop(inter)
+        inter = torch.sum(inter, dim=1)
+
+        return w + inter
 
 
 class Flatten(nn.Module):
@@ -34,47 +47,116 @@ class Flatten(nn.Module):
         return x.squeeze()
 
 
-class DataFrameDataSet(Dataset):
+class DeepCoNNDataSet(Dataset):
 
-    def __init__(self, data: pd.DataFrame):
-        self.__data = data
+    def __init__(self, data: pd.DataFrame, folder, zero_index: int,
+                 review_length: int, device: torch.device):
+        self._data = data.reset_index(drop=True)
+
+        self._lmdb = lmdb.open(os.path.join(folder, 'lmdb'), readonly=True)
+
+        with open(os.path.join(folder, 'user_to_review_ids.json'), 'r') as f:
+            self._user_to_review_ids = json.load(f)
+
+        with open(os.path.join(folder, 'item_to_review_ids.json'), 'r') as f:
+            self._item_to_review_ids = json.load(f)
+
+        self._zero_index = zero_index
+        self._review_length = review_length
+        self._device = device
 
     def __len__(self):
-        return len(self.__data)
+        return len(self._data)
 
-    def __getitem__(self, item):
-        return self.__data.loc[item].to_list()
-        pass
+    # noinspection PyArgumentList
+    def __getitem__(self, x):
+        """
+        :param x:
+        :return: review token ids of users and items with fixed length
+        """
+        uir = self._data.loc[x].to_dict()
+        user = uir['user']
+        item = uir['item']
+        rating = uir['rating']
+
+        user_review_ids = self._user_to_review_ids[user]
+        item_review_ids = self._item_to_review_ids[item]
+
+        with self._lmdb.begin() as txn:
+            user_review_tokens = [txn.get(str(i).encode())
+                                  for i in user_review_ids]
+            item_review_tokens = [txn.get(str(i).encode())
+                                  for i in item_review_ids]
+
+        user_review_tokens = [json.loads(str(v, 'utf-8'))['token_ids']
+                              for v in user_review_tokens]
+        item_review_tokens = [json.loads(str(v, 'utf-8'))['token_ids']
+                              for v in item_review_tokens]
+
+        user_tokens = self.review_ids_to_token_ids(user_review_tokens)
+        item_tokens = self.review_ids_to_token_ids(item_review_tokens)
+
+        user_tokens = torch.LongTensor(user_tokens).to(self._device)
+        item_tokens = torch.LongTensor(item_tokens).to(self._device)
+        rating = torch.FloatTensor([rating]).to(self._device)
+
+        return user_tokens, item_tokens, rating
+
+    def close_lmdb(self):
+        self._lmdb.close()
+
+    def review_ids_to_token_ids(self, review_list: list):
+        # _r = self.review[self.review.index.isin(review_ids)]
+        random.shuffle(review_list)
+        # result = sum(result, [])
+        result = []
+        for sen in review_list:
+            if len(result) < self._review_length:
+                result += sen
+            else:
+                break
+
+        if len(result) > self._review_length:
+            result = result[:self._review_length]
+        elif len(result) < self._review_length:
+            result = result + \
+                     ([self._zero_index] * (self._review_length-len(result)))
+
+        return result
 
 
-class FactorizationMachine(nn.Module):
+class DataPreFetcher:
 
-    def __init__(self, factor_size: int, is_cuda=False):
-        super(FactorizationMachine, self).__init__()
-        self.__linear = nn.Linear(factor_size, 1)
-        self.__v = torch.randn((factor_size, factor_size), requires_grad=True)
-        if is_cuda:
-            self.__v = self.__v.cuda()
-        self.__drop = nn.Dropout()
+    def __init__(self, loader):
+        self._loader = iter(loader)
+        self._rating = None
+        self._item_review = None
+        self._user_review = None
+        self.pre_load()
 
-    def forward(self, x):
-        # linear regression
-        w = self.__linear(x).squeeze()
+    def pre_load(self):
+        try:
+            self._user_review, self._item_review, self._rating \
+                = next(self._loader)
+        except StopIteration:
+            self._rating = None
+            self._item_review = None
+            self._user_review = None
+            return
 
-        # cross feature
-        inter1 = torch.matmul(x, self.__v)
-        inter2 = torch.matmul(x**2, self.__v**2)
-        inter = (inter1**2 - inter2) * 0.5
-        inter = self.__drop(inter)
-        inter = torch.sum(inter, dim=1)
-
-        return w + inter
+    def next(self):
+        # data = self._next_data
+        user_review = self._user_review
+        item_review = self._item_review
+        rating = self._rating
+        self.pre_load()
+        return user_review, item_review, rating
 
 
 class DeepCoNN(nn.Module):
 
-    def __init__(self, review_length, word_vec_dim, conv_length,
-                 conv_kernel_num, latent_factor_num, is_cuda=False):
+    def __init__(self, review_length, word_vec_dim, fm_k, conv_length,
+                 conv_kernel_num, latent_factor_num):
         """
         :param review_length: 评论单词数
         :param word_vec_dim: 词向量维度
@@ -114,7 +196,7 @@ class DeepCoNN(nn.Module):
 
         # input: (batch_size, 2*latent_factor_num)
         self.__factor_machine = FactorizationMachine(latent_factor_num * 2,
-                                                     is_cuda)
+                                                     fm_k)
 
     def forward(self, user_review, item_review):
         user_latent = self.__user_conv(user_review)
@@ -127,250 +209,197 @@ class DeepCoNN(nn.Module):
 
         return prediction
 
-    def evaluate(self, user_review, item_review, rating):
-        # todo
-        pass
-
 
 def get_review_average_length(df: pd.DataFrame, review_column: str):
     df['sentences_length'] = df[review_column].apply(lambda x: len(x))
     return df['sentences_length'].mean()
 
 
+# noinspection PyUnreachableCode,PyArgumentList
 class DeepCoNNTrainTest:
 
-    def __init__(self, epoch, batch_size, review_length, data_folder,
-                 is_cuda=False):
+    # noinspection PyUnresolvedReferences
+    def __init__(self, epoch, batch_size, dir_path, device, model_args,
+                 learning_rate, save_folder):
         """
         训练，测试DeepCoNN
-        :param epoch:
-        :param batch_size:
-        :param review_length:
-        :param data_folder:
-        :param is_cuda:
         """
-        self.epoch = epoch
-        self.batch_size = batch_size
-        self.review_length = review_length
-        self.is_cuda = is_cuda
-        self.data_folder = data_folder
+        self._epoch = epoch
+        self._batch_size = batch_size
+        self._review_length = model_args['review_length']
+        self._dir_path = os.path.join(dir_path, 'DeepCoNN')
+        self._device = torch.device(device)
+        self._save_dir = os.path.join(dir_path, 'DeepCoNN', save_folder)
 
         logger.info('epoch:{:<8d} batch size:{:d}'.format(epoch, batch_size))
 
+        if not os.path.exists(self._save_dir):
+            os.makedirs(self._save_dir)
+
         # read data
-        self.user_item_rating = pd.read_json(
-            '{}/user_item_rating.json'.format(data_folder))
-        self.review = pd.read_json(
-            '{}/review.json'.format(data_folder))
-        self.user_to_review_ids = pd.read_json(
-            '{}/user_to_review_ids.json'.format(data_folder))
-        self.item_to_review_ids = pd.read_json(
-            '{}/item_to_review_ids.json'.format(data_folder))
+        self._train_data = pd.read_csv(
+            os.path.join(self._dir_path,  'train_user_item_rating.csv'))
+        self._test_data = pd.read_csv(
+            os.path.join(self._dir_path, 'test_user_item_rating.csv'))
 
-        if os.path.exists(
-                os.path.join(data_folder, 'train_user_item_rating.json')):
-
-            train_data = pd.read_json(
-                '{}/train_user_item_rating.json'.format(data_folder))
-            self.valid_data = pd.read_json(
-                '{}/valid_user_item_rating.json'.format(data_folder))
-            self.test_data = pd.read_json(
-                '{}/test_user_item_rating.json'.format(data_folder))
-        else:
-            train_data, self.valid_data, self.test_data \
-                = data_split(self.user_item_rating)
-
-            train_data.to_json(
-                '{}/train_user_item_rating.json'.format(data_folder))
-            self.valid_data.to_json(
-                '{}/valid_user_item_rating.json'.format(data_folder))
-            self.test_data.to_json(
-                '{}/test_user_item_rating.json'.format(data_folder))
-
-        logger.info('average sentences length: {:d}'.format(review_length))
+        with open(os.path.join(self._dir_path, 'dataset_meta_info.json'),
+                  'r') as f:
+            dataset_meta_info = json.load(f)
+        self._user_size = dataset_meta_info['user_size']
+        self._item_size = dataset_meta_info['item_size']
+        self._dataset_size = dataset_meta_info['dataset_size']
 
         # initial DeepCoNN model
-        self.model = DeepCoNN(review_length=review_length,
-                              word_vec_dim=300,
-                              conv_length=3,
-                              conv_kernel_num=100,
-                              latent_factor_num=100,
-                              is_cuda=self.is_cuda)
+        self._model = DeepCoNN(review_length=model_args['review_length'],
+                               word_vec_dim=model_args['word_vector_dim'],
+                               fm_k=model_args['fm_k'],
+                               conv_length=model_args['conv_length'],
+                               conv_kernel_num=model_args['conv_kernel_num'],
+                               latent_factor_num=model_args['latent_factor_num']
+                               ).to(self._device)
 
-        if self.is_cuda:
-            self.model.cuda()
-
-        self.optimizer = torch.optim.Adam(self.model.parameters(), lr=0.02)
-        self.loss_func = torch.nn.MSELoss()
+        self._optimizer = torch.optim.Adam(self._model.parameters(),
+                                           lr=learning_rate)
+        self._loss_func = torch.nn.MSELoss()
 
         # load pretrained embedding
         logger.info('Initialize word embedding model for pytorch')
         embedding = torch.FloatTensor(gensim_model.vectors)
         zero_tensor = torch.zeros(size=embedding[:1].size())
-        self.zero_index = len(embedding)
+        self._zero_index = embedding.size()[0]
         embedding = torch.cat((embedding, zero_tensor), dim=0)
-        self.embedding = nn.Embedding.from_pretrained(embedding)
-        if self.is_cuda:
-            self.embedding = self.embedding.cuda()
+        self._embedding \
+            = nn.Embedding.from_pretrained(embedding).to(self._device)
 
         logger.info('Model initialized, start training...')
 
         # dataloader
         logger.info('Initialize dataloader.')
-        self.data_loader = DataLoader(DataFrameDataSet(train_data),
-                                      batch_size=batch_size,
-                                      shuffle=True)
+        data = pd.read_csv('{}/train_user_item_rating.csv'
+                           .format(self._dir_path))
+        test_data = pd.read_csv('{}/test_user_item_rating.csv'
+                                .format(self._dir_path))
+
+        train_data, valid_data = data_split_pandas(data, 0.9, 0.1)
+
+        train_dataset = DeepCoNNDataSet(data=train_data,
+                                        folder=self._dir_path,
+                                        zero_index=self._zero_index,
+                                        review_length=self._review_length,
+                                        device=self._device)
+        self._valid_dataset = DeepCoNNDataSet(data=valid_data,
+                                              folder=self._dir_path,
+                                              zero_index=self._zero_index,
+                                              review_length=self._review_length,
+                                              device=self._device)
+
+        self._test_dataset = DeepCoNNDataSet(data=test_data,
+                                             folder=self._dir_path,
+                                             zero_index=self._zero_index,
+                                             review_length=self._review_length,
+                                             device=self._device)
+
+        self._data_loader = DataLoader(train_dataset,
+                                       batch_size=batch_size,
+                                       shuffle=True)
 
     def train(self):
-        for e in range(self.epoch):
-            i = 0
-            for data in self.data_loader:
+        valid_data_loader = DataLoader(self._valid_dataset,
+                                       batch_size=self._batch_size,
+                                       shuffle=False)
 
-                batch_data = pd.DataFrame(data={'user': data[0],
-                                                'item': data[1],
-                                                'rating': data[2]})
+        logger.info('Start training.')
+        best_valid_loss = float('inf')
+        best_model_state_dict = None
+        best_valid_epoch = 0
+        for e in range(self._epoch):
+            fetcher = DataPreFetcher(self._data_loader)
+            user_tokens, item_tokens, rating = fetcher.next()
 
-                batch_user_review_vectors, batch_item_review_vectors = \
-                    self.uir_to_token_vectors(batch_data)
+            train_loss = None
+            while user_tokens is not None:
+                user_review_vec = self._embedding(user_tokens).unsqueeze(dim=1)
+                item_review_vec = self._embedding(item_tokens).unsqueeze(dim=1)
 
-                rating = batch_data['rating'].to_list()
-                rating = torch.Tensor(rating)
-                if self.is_cuda:
-                    rating = rating.cuda()
+                pred = self._model(user_review_vec,
+                                   item_review_vec)
 
-                pred = self.model(batch_user_review_vectors,
-                                  batch_item_review_vectors)
+                train_loss = self._loss_func(pred, rating.flatten())
+                self._optimizer.zero_grad()
+                train_loss.backward()
+                self._optimizer.step()
 
-                loss = self.loss_func(pred, rating)
-                self.optimizer.zero_grad()
-                loss.backward()
-                self.optimizer.step()
-
-                i += 1
-                if i % 50 == 0:
-                    logger.info(
-                        'mse_loss: {:.5f}'.format(loss.cpu().data.numpy()))
+                user_tokens, item_tokens, rating = fetcher.next()
 
             # validate
-            valid_user_review_vectors, valid_item_review_vectors = \
-                self.uir_to_token_vectors(self.valid_data
-                                          .tail(200))  # memory limit
+            fetcher = DataPreFetcher(valid_data_loader)
+            valid_user_tokens, valid_item_tokens, valid_rating = fetcher.next()
+            # pred = torch.FloatTensor()
+            # rating = torch.FloatTensor()
+            error = torch.FloatTensor().to(self._device)
+            while valid_user_tokens is not None:
+                user_review_vec = \
+                    self._embedding(valid_user_tokens).unsqueeze(dim=1)
+                item_review_vec = \
+                    self._embedding(valid_item_tokens).unsqueeze(dim=1)
 
-            valid_rating = self.valid_data['rating'].tail(200).to_list()
-            valid_rating = torch.Tensor(valid_rating)
-            if self.is_cuda:
-                valid_rating = valid_rating.cuda()
+                batch_pred = self._model(user_review_vec,
+                                         item_review_vec)
 
-            valid_pred = self.model(valid_user_review_vectors,
-                                    valid_item_review_vectors)
+                batch_error = (batch_pred - valid_rating.flatten())
+                error = torch.cat((error, batch_error))
 
-            valid_loss = self.loss_func(valid_pred, valid_rating)
+                valid_user_tokens, valid_item_tokens, valid_rating \
+                    = fetcher.next()
+
+            error = torch.mean(error**2).item()  # mse
+            if best_valid_loss > error:
+                best_model_state_dict = copy.deepcopy(self._model.state_dict())
+                best_valid_loss = error
+                best_valid_epoch = e
             logger.info(
-                'valid mse_loss: {:.5f}'.format(valid_loss.cpu().data.numpy()))
+                'epoch: {}, train mse_loss: {:.5f}, valid mse_loss: {:.5f}'
+                .format(e, train_loss, error))
 
-        torch.save(self.model.cpu(),
-                   os.path.join(self.data_folder, 'DeepCoNN.pkl'))
+        # save
+        torch.save(best_model_state_dict,
+                   os.path.join(self._save_dir,
+                                'DeepCoNN.tar'))
+
+        with open(os.path.join(self._save_dir, 'training.json'), 'w') as f:
+            json.dump({'epoch': best_valid_epoch,
+                       'valid_loss': best_valid_loss},
+                      f)
 
     def test(self):
-        self.model = torch.load(os.path.join(self.data_folder, 'DeepCoNN.pkl'))
-        if self.is_cuda:
-            self.model.cuda()
+        self._model.load_state_dict(torch.load(os.path.join(self._save_dir,
+                                                            'DeepCoNN.tar')))
+        data_loader = DataLoader(self._test_dataset,
+                                 batch_size=self._batch_size,
+                                 shuffle=False)
 
-        batch_size = 100
-        test_pred = torch.Tensor()
-        if self.is_cuda:
-            test_pred = test_pred.cuda()
-        for i in range(0, len(self.test_data), batch_size):
-            test_user_review_vectors, test_item_review_vectors = \
-                self.uir_to_token_vectors(self.test_data
-                                          .loc[i: i+batch_size-1, :])
+        error = torch.FloatTensor([]).to(self._device)
+        pred = torch.FloatTensor([]).to(self._device)
+        for ur, ir, r in data_loader:
+            user_review_vec = \
+                self._embedding(ur).unsqueeze(dim=1)
+            item_review_vec = \
+                self._embedding(ir).unsqueeze(dim=1)
 
-            batch_pred = self.model(test_user_review_vectors,
-                                    test_item_review_vectors)
+            batch_pred = self._model(user_review_vec,
+                                     item_review_vec)
 
-            test_pred = torch.cat((test_pred, batch_pred))
+            pred = torch.cat((pred, batch_pred))
 
-        test_rating = self.test_data['rating'].to_list()
-        test_rating = torch.Tensor(test_rating)
-        if self.is_cuda:
-            test_rating = test_rating.cuda()
+            batch_error = (batch_pred - r.flatten())
+            error = torch.cat((error, batch_error))
+        error = torch.mean(error**2).item()
+        logger.info('Test MSE: {:.5f}'.format(error))
+        with open(os.path.join(self._save_dir, 'test_result.json'), 'w') as f:
+            json.dump({'mse': error}, f)
+        self._test_data['predict'] = pred.tolist()
+        self._test_data.to_csv(os.path.join(self._save_dir,
+                                            'test_result_detail.csv'))
 
-        print('actual rating:')
-        print(test_rating.cpu()[:10])
-        print('predicting rating:')
-        print(test_pred.cpu()[:10])
 
-        print(test_pred.shape, test_rating.shape)
-        test_loss = self.loss_func(test_pred, test_rating)
-        logger.info(
-            'test mse_loss: {:.5f}'.format(test_loss.cpu().data.numpy()))
 
-        self.test_data['predict_rating'] = test_pred.tolist()
-        self.test_data.to_csv(os.path.join(self.data_folder, 'test_result.csv'))
-
-        self.test_data['square_test'] \
-            = (self.test_data['rating'] - self.test_data['predict_rating']) ** 2
-
-        mse_on_rating = self.test_data.groupby('rating')['square_error'].mean()
-        mse_on_rating.to_csv(os.path.join(self.data_folder,
-                                          'test_mse_of_ratings'))
-
-    def uir_to_token_vectors(self, uir: pd.DataFrame):
-        """
-        根据 <user,item,rating> triplets, 构造对应的评论词向量
-        :param uir:
-        :return:
-        """
-        batch_user_data = pd.merge(left=uir,
-                                   right=self.user_to_review_ids,
-                                   left_on='user',
-                                   right_index=True,
-                                   how='left')
-
-        batch_item_data = pd.merge(left=uir,
-                                   right=self.item_to_review_ids,
-                                   left_on='item',
-                                   right_index=True,
-                                   how='left')
-
-        batch_user_data['token_ids'] = batch_user_data['review_ids'] \
-            .apply(lambda x: self.review_ids_to_token_ids(x))
-
-        batch_item_data['token_ids'] = batch_item_data['review_ids'] \
-            .apply(lambda x: self.review_ids_to_token_ids(x))
-
-        batch_user_review = torch.LongTensor(
-            batch_user_data['token_ids'].to_list())
-        batch_item_review = torch.LongTensor(
-            batch_item_data['token_ids'].to_list())
-
-        if self.is_cuda:
-            batch_item_review = batch_item_review.cuda()
-            batch_user_review = batch_user_review.cuda()
-
-        batch_user_review_vec = self.embedding(batch_user_review)
-        batch_item_review_vec = self.embedding(batch_item_review)
-
-        batch_user_review_vec = batch_user_review_vec.unsqueeze(dim=1)
-        batch_item_review_vec = batch_item_review_vec.unsqueeze(dim=1)
-
-        return batch_user_review_vec, batch_item_review_vec
-
-    def review_ids_to_token_ids(self, review_ids: list):
-        _r = self.review[self.review.index.isin(review_ids)]
-        _r = _r.sample(frac=1.)['token_ids'].to_list()
-        # result = sum(result, [])
-        result = []
-        for sen in _r:
-            if len(result) < self.review_length:
-                result += sen
-            else:
-                break
-
-        if len(result) > self.review_length:
-            result = result[:self.review_length]
-        elif len(result) < self.review_length:
-            result = result + \
-                     ([self.zero_index] * (self.review_length-len(result)))
-
-        return result

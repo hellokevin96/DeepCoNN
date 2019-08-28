@@ -1,0 +1,25 @@
+dataset_path: data/music_instruments/Musical_Instruments_5.json
+
+save_folder: laten-factor-100
+
+data_handle:
+  rebuild: false
+  train_ratio: 0.8
+  test_ratio: 0.2
+
+training:
+  epoch: 4
+  batch_size: 256
+  device: "cuda:0"
+  learning_rate: 0.02
+
+model:
+  review_length: 100
+  word_vector_dim: 300
+  conv_length: 3
+  conv_kernel_num: 100
+  fm_k: 100 # Factorization Machine 交叉向量维度
+  model_static_dict: model
+  latent_factor_num: 100
+
+
