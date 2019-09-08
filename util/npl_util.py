@@ -4,14 +4,22 @@ from gensim.models.keyedvectors import KeyedVectors
 import logging
 import re
 
-util_logger = logging.getLogger('DeepCoNN.npl')
+util_logger = logging.getLogger('RATE.npl')
 
-util_logger.info('loading google pretrained word2vec model')
-gensim_model = KeyedVectors.load_word2vec_format(
-    'data/GoogleNews-vectors-negative300.bin',
-    limit=int(1e4),
-    binary=True)
-util_logger.info('loaded')
+
+class WordVector(object):
+    _instance = None
+
+    def __new__(cls, *args, **kwargs):
+        if cls._instance is None:
+            util_logger.info('loading google pretrained word2vec model')
+            cls._instance = \
+                KeyedVectors.load_word2vec_format(
+                    'data/GoogleNews-vectors-negative300.bin',
+                    limit=int(1e4),
+                    binary=True)
+            util_logger.info('loaded')
+        return cls._instance
 
 
 def word2vec(word: str):
@@ -21,7 +29,7 @@ def word2vec(word: str):
     :return:
     """
     try:
-        return gensim_model[word]
+        return WordVector()[word]
     except KeyError:
         return word
 
@@ -33,7 +41,7 @@ def word2id(word: str):
     :return:
     """
     try:
-        return gensim_model.vocab[word].index
+        return WordVector().vocab[word].index
     except KeyError:
         return -1
 

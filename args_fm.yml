@@ -1,0 +1,21 @@
+#dataset_path: data/music_instruments/Musical_Instruments_5.json
+#dataset_path: data/movie/Movies_and_TV_5.json
+dataset_path: data/kindle_store/Kindle_Store_5.json
+
+save_folder: laten_factor_100
+
+data_handle:
+  rebuild: false
+  train_ratio: 0.8
+  test_ratio: 0.2
+
+training:
+  epoch: 2
+  batch_size: 256
+  device: "cuda:0"
+  learning_rate: 0.001
+
+model:
+  fm_k: 100 # Factorization Machine 交叉向量维度
+
+

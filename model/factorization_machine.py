@@ -1,188 +1,234 @@
 # -*- coding: utf-8 -*-
 import json
-import pickle
-from datetime import datetime
+import math
 import os
+import random
+
+import lmdb
+import msgpack
+from tqdm import tqdm
+import copy
 from torch.utils.data import TensorDataset, DataLoader
-from skorch import NeuralNetRegressor
+from util import data_split_pandas
+import logging
 import torch.nn as nn
 import torch
 import pandas as pd
 import numpy as np
 
+logger = logging.getLogger('RATE.FM.train_test')
+
 
 class FactorizationMachine(nn.Module):
 
-    def __init__(self, sample_size: int, factor_size: int, is_cuda=False):
+    # noinspection PyArgumentList
+    def __init__(self, sample_size: int, factor_size: int):
         super(FactorizationMachine, self).__init__()
-        self.__linear = nn.Linear(sample_size, 1)
-        # self.__v = torch.randn((sample_size, factor_size), requires_grad=True)
-        self.__v = torch.normal(0, .001, (sample_size, factor_size),
-                                requires_grad=True)
-        if is_cuda:
-            self.__v = self.__v.cuda()
-        self.__drop = nn.Dropout(0.2)
+        self._linear = nn.Linear(sample_size, 1)
+        self._v = torch.nn.Parameter(torch.normal(0, .001,
+                                                  (sample_size, factor_size)))
+        self._drop = nn.Dropout(0.2)
 
     def forward(self, x):
         # linear regression
-        w = self.__linear(x)
+        w = self._linear(x).squeeze()
 
         # cross feature
-        inter1 = torch.matmul(x, self.__v).sum(1, keepdim=True)
-        inter2 = torch.matmul(x.pow(2), self.__v.pow(2)).sum(1, keepdim=True)
-        inter = (inter1 - inter2) * 0.5
+        inter1 = torch.matmul(x, self._v)
+        inter2 = torch.matmul(x**2, self._v**2)
+        inter = (inter1**2 - inter2) * 0.5
+        inter = self._drop(inter)
+        inter = torch.sum(inter, dim=1)
 
         return w + inter
 
 
-def fm_data(data_path: str):
-    # get user and item id
-    # data_folder = 'data/music_instruments/fm/'
-    data_folder = 'data/movie/fm/'
-    train_data = pd.read_json(
-        os.path.join(data_folder, 'train_user_item_rating.json'))
-    # train_data = train_data.loc[:, ['user_id', 'item_id', 'rating']]
-    valid_data = pd.read_json(
-        os.path.join(data_folder, 'valid_user_item_rating.json'))
-    # valid_data = valid_data.loc[:, ['user_id', 'item_id', 'rating']]
-    test_data = pd.read_json(
-        os.path.join(data_folder, 'test_user_item_rating.json'))
-    # test_data = test_data.loc[:, ['user_id', 'item_id', 'rating']]
-    train_data_size = len(train_data) + len(valid_data)
+class FMDataLoader:
 
-    data = pd.concat((train_data, valid_data, test_data)).reset_index(drop=True)
+    def __init__(self, lmdb_path, feature_size, batch_size,
+                 device: torch.device, shuffle=False):
+        self._lmdb_data = lmdb.open(lmdb_path, readonly=True)
+        lmdb_entry_size = self._lmdb_data.stat()['entries']
+        self._feature_size = feature_size
+        self._batch_size = batch_size
+        self._device = device
 
-    # min_date = data['time'].min().item()
-    # min_date = datetime.fromtimestamp(min_date)
+        self._idx_list = list(range(lmdb_entry_size))
+        self._shuffle = shuffle
+        if shuffle:
+            random.shuffle(self._idx_list)
+        self._idx = 0
 
-    data['rated_item'] = data.apply(
-        lambda r: (r['time'], r['item_id']), axis='columns')
-    user_group = data.groupby('user_id')['rated_item'].apply(list)
-    user_group = user_group.apply(lambda r: sorted(r, key=lambda l: l[0]))
+    def __len__(self):
+        return math.ceil(len(self._idx_list) // self._batch_size)
 
-    del data['rated_item']
-    data = pd.merge(left=data,
-                    left_on='user_id',
-                    right=user_group,
-                    right_index=True,
-                    how='inner')
-    data['rated_item'] = data.apply(
-        lambda r:
-            list(filter(lambda l: l[0] > r['time'],
-                        r['rated_item'])),
-        axis='columns')
+    def __iter__(self):
+        return self
 
-    data['rated_item'] = data.apply(lambda r: [l[1] for l in r['rated_item']],
-                                    axis='columns')
+    def __next__(self):
+        if self._idx < len(self._idx_list):
+            idx_ls = self._idx_list[self._idx: self._idx+self._batch_size]
+            batch_size = len(idx_ls)
+            self._idx += self._batch_size
 
-    # data = data.loc[:, ['user_id', 'item_id', 'rated_item', 'time', 'rating']]
+            with self._lmdb_data.begin() as txn:
+                entry_data = [msgpack.unpackb(txn.get(str(x).encode()),
+                                              raw=False)
+                              for x in idx_ls]
 
-    # train_data = pd.merge(left=train_data,
-    #                       left_on=('user_id', 'item_id'),
-    #                       right=data,
-    #                       right_on=('user_id', 'item_id'),
-    #                       how='left')
-    #
-    # valid_data = pd.merge(left=valid_data,
-    #                       left_on=('user_id', 'item_id'),
-    #                       right=data,
-    #                       right_on=('user_id', 'item_id'),
-    #                       how='left')
-    #
-    # test_data = pd.merge(left=test_data,
-    #                      left_on=('user_id', 'item_id'),
-    #                      right=data,
-    #                      right_on=('user_id', 'item_id'),
-    #                      how='left')
+            x_index = [x['put_idx'] for x in entry_data]
+            x_value = [x['put_value'] for x in entry_data]
+            rating = [x['rating'] for x in entry_data]
 
-    with open(os.path.join(data_folder, 'dataset_meta_info.json'), 'r') as f:
-        dataset_meta_info = json.load(f)
-    user_size = dataset_meta_info['user_size']
-    item_size = dataset_meta_info['item_size']
-    # return user_size, item_size, train_data, min_date
-    min_date = datetime.fromtimestamp(dataset_meta_info['mindate'])
+            if self._device == torch.device('cpu'):
+                x_tensor = np.zeros((batch_size, self._feature_size),
+                                    dtype=np.float32)
+                x_tensor = torch.from_numpy(x_tensor)
+            else:
+                x_tensor = torch.cuda.FloatTensor(batch_size,
+                                                  self._feature_size,
+                                                  device=self._device).fill_(0)
 
-    x_length = user_size+3*item_size+1
+            x_index = map(lambda x: torch.from_numpy(np.asarray(x, np.longlong)).to(self._device),
+                          x_index)
+            x_value = list(
+                map(lambda x: torch.from_numpy(np.asarray(x, np.float32)).to(self._device),
+                    x_value))
 
-    data = data.reset_index(drop=True)
-    data['index'] = data.index
-    tensor_x = np.zeros((len(data), x_length))
+            for i, (x_i, x_v) in enumerate(zip(x_index, x_value)):
+                x_tensor[i].scatter_(dim=0, index=x_i, src=x_v)
 
-    # user_id, item_id one-hot
-    x = data.loc[:, ['user_id', 'item_id', 'index']].to_numpy()
-    # x = torch.LongTensor(x)
-    x[:, 1] += user_size
-    x[:, 0] = x_length * x[:, 2] + x[:, 0]
-    x[:, 1] = x_length * x[:, 2] + x[:, 1]
-    x = np.delete(x, 2, 1).flatten()
-    tensor_x.put(x, 1)
+            rating = np.asarray(rating, dtype=np.float32)
+            rating = torch.from_numpy(rating).to(self._device)
 
-    # other movie rated
-    rated_movie = data \
-        .apply(lambda r: [(r['index'],
-                           l + user_size + item_size)
-                          for l in r['rated_item']],
-               axis='columns').to_list()
-    rated_movie_weight = [[1 / len(r)] * len(r) if len(r) > 0 else []
-                          for r in rated_movie]
-    rated_movie = sum(rated_movie, [])
-    rated_movie = [x[0] * x_length + x[1] for x in rated_movie]
-    rated_movie_weight = sum(rated_movie_weight, [])
-    tensor_x.put(rated_movie, rated_movie_weight)
+            return x_tensor, rating
+        else:
+            self._idx = 0
+            if self._shuffle:
+                random.shuffle(self._idx_list)
+            raise StopIteration
 
-    # time(month)
-    time = data['time'].apply(lambda r: datetime.fromtimestamp(r))
-    time -= min_date
-    time = time.apply(lambda r: r.days // 30).to_numpy()
-    time_index = data['index'].to_numpy() * x_length \
-                 + user_size + 2 * item_size
-    tensor_x.put(time_index, time)
-
-    # last rated movie
-    last_item = data.apply(
-        lambda r: (r['index'], r['rated_item'][-1:]),
-        axis='columns')
-    last_item = last_item.apply(
-        lambda r: [r[0] * x_length + user_size + 2 * item_size + 1 + r[1][0]]
-        if len(r[1]) > 0 else []).to_list()
-
-    last_item = sum(last_item, [])
-    tensor_x.put(last_item, 1)
-
-    # tensor_x = torch.from_numpy(tensor_x).float()
-    # y = torch.from_numpy(data['rating']
-    #                      .to_numpy()).float().unsqueeze(1)
-    tensor_x = tensor_x.astype(np.float32)
-    y = data['rating'].to_numpy()
-    y = np.expand_dims(y, axis=1).astype(np.float32)
-
-    train_x = tensor_x[:train_data_size]
-    train_y = y[:train_data_size]
-
-    test_x = tensor_x[train_data_size:]
-    test_y = y[train_data_size:]
-    # print(tensor_x.shape)
-    # print(y.shape)
-    net_fm = NeuralNetRegressor(FactorizationMachine,
-                                max_epochs=100,
-                                lr=0.001,
-                                optimizer=torch.optim.Adam,
-                                module__sample_size=x_length,
-                                module__factor_size=100,
-                                # device='cuda',
-                                module__is_cuda=False)
-    net_fm.fit(train_x, train_y)
-    test_pred = net_fm.predict(test_x).flatten()
-    test_y = test_y.flatten()
-    test_mse = np.sqrt((test_pred - test_y)**2).mean()
-    print(test_mse)
-    with open(os.path.join(data_folder, 'fm.pkl'), 'wb') as f:
-        pickle.dump(net_fm, f)
-
-    # score = net_fm.score(test_x, test_y)
-    # print(score)
+    def close_lmdb(self):
+        self._lmdb_data.close()
 
 
-if __name__ == '__main__':
-    # fm_train(*fm_data('s'))
-    fm_data('s')
+class FMTrainTest:
+
+    def __init__(self, epoch, batch_size, dir_path, device, model_args,
+                 learning_rate, save_folder):
+        self._epoch = epoch
+        self._batch_size = batch_size
+        self._dir_path = os.path.join(dir_path, 'FM')
+        self._device = torch.device(device)
+        self._model_args = model_args
+        self._lr = learning_rate
+        self._save_dir = os.path.join(self._dir_path, save_folder)
+
+        if not os.path.exists(self._save_dir):
+            os.makedirs(self._save_dir)
+
+        with open(os.path.join(self._dir_path, 'dataset_meta_info.json'),
+                  'r') as f:
+            dataset_meta_info = json.load(f)
+
+        self._user_size = dataset_meta_info['user_size']
+        self._item_size = dataset_meta_info['item_size']
+        self._feature_size = self._user_size + 3 * self._item_size + 1
+
+        self._model = FactorizationMachine(self._user_size+self._item_size*3+1,
+                                           model_args['fm_k'],).to(self._device)
+
+        self._optimizer = torch.optim.Adam(self._model.parameters(),
+                                           lr=learning_rate)
+        self._loss_func = torch.nn.MSELoss()
+
+        self._test_data = FMDataLoader(os.path.join(self._dir_path, 'test_lmdb'),
+                                       self._feature_size,
+                                       self._batch_size,
+                                       self._device,
+                                       shuffle=False)
+
+    def train(self):
+        # data = pd.read_json(os.path.join(self._dir_path,
+        #                                  'train_user_item_rating.json'))
+        # train_data, valid_data = data_split_pandas(data, 0.9, 0.1)
+
+        train_data = FMDataLoader(os.path.join(self._dir_path, 'train_lmdb'),
+                                  self._feature_size,
+                                  self._batch_size,
+                                  self._device,
+                                  shuffle=True)
+
+        valid_data = FMDataLoader(os.path.join(self._dir_path, 'valid_lmdb'),
+                                  self._feature_size,
+                                  self._batch_size,
+                                  self._device,
+                                  shuffle=False)
+
+        logger.info('Start training.')
+        best_valid_loss = float('inf')
+        best_valid_epoch = 0
+        for e in range(self._epoch):
+            train_loss = None
+            for x, y in tqdm(train_data):
+                pred = self._model(x)
+                train_loss = self._loss_func(pred, y.flatten())
+                self._optimizer.zero_grad()
+                train_loss.backward()
+                self._optimizer.step()
+
+            # valid
+            # error = torch.cuda.FloatTensor([0], device=self._device)
+            error = []
+            with torch.no_grad():
+                for x, y in tqdm(valid_data):
+                    pred = self._model(x)
+                    batch_error = (pred - y.flatten())
+
+                    error.append(batch_error.cpu().numpy())
+
+            error = np.concatenate(error, axis=None)**2
+            error = error.mean()
+            if best_valid_loss > error:
+                best_valid_loss = error
+                best_valid_epoch = e
+
+                # save
+                torch.save(self._model.state_dict(),
+                           os.path.join(self._save_dir,
+                                        'FM.tar'))
+            logger.info(
+                'epoch: {:<3d} train mse_loss: {:.5f}, valid mse_loss: {:.5f}'
+                .format(e, train_loss, error))
+
+        with open(os.path.join(self._save_dir, 'training.json'), 'w') as f:
+            json.dump({'epoch': best_valid_epoch,
+                       'valid_loss': best_valid_loss.item()},
+                      f)
+
+    def test(self):
+        self._model.load_state_dict(torch.load(os.path.join(self._save_dir,
+                                                            'FM.tar')))
+
+        # error = torch.FloatTensor().to(self._device)
+        # pred = torch.FloatTensor().to(self._device)
+        error = []
+        for x, y in self._test_data:
+            with torch.no_grad():
+                batch_pred = self._model(x)
+                # pred = torch.cat((pred, batch_pred))
+
+                batch_error = (batch_pred - y.flatten())
+                error.append(batch_error.cpu().numpy())
+
+        error = np.concatenate(error, axis=None)**2
+        error = error.mean()
+
+        logger.info('Test MSE: {:.5f}'.format(error))
+
+        with open(os.path.join(self._save_dir, 'test_result.json'), 'w') as f:
+            json.dump({'mse': error.item()}, f)
+
+        # data['predict'] = pred.tolist()
+        # data.to_json(os.path.join(self._save_dir,
+        #                           'test_result_detail.json'))

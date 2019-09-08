@@ -1,6 +1,7 @@
-dataset_path: data/music_instruments/Musical_Instruments_5.json
+dataset_path: data/kindle_store/Kindle_Store_5.json
+#dataset_path: data/music_instruments/Musical_Instruments_5.json
 
-save_folder: laten-factor-100
+save_folder: laten_factor_100
 
 data_handle:
   rebuild: false
@@ -8,9 +9,9 @@ data_handle:
   test_ratio: 0.2
 
 training:
-  epoch: 4
+  epoch: 2
   batch_size: 256
-  device: "cuda:0"
+  device: "cpu"
   learning_rate: 0.02
 
 model:
@@ -18,8 +19,7 @@ model:
   word_vector_dim: 300
   conv_length: 3
   conv_kernel_num: 100
-  fm_k: 100 # Factorization Machine 交叉向量维度
-  model_static_dict: model
+  fm_k: 32 # Factorization Machine 交叉向量维度
   latent_factor_num: 100
 
 
